@@ -24,7 +24,12 @@ windows that discriminate between two equal-prior candidates: at most K
 disjoint closed intervals within a bin budget, exactly maximizing the
 accuracy (1 + |p0 - p1|) / 2 of the rule "an ion inside the windows votes
 for the candidate with the higher hit probability, an ion outside votes
-for the other one", with fully specified exact tie-breaking.
+for the other one", with fully specified exact tie-breaking. An eighth
+endpoint conditions a fragmentation spectrum on an observed parent-ion
+shift: the parent's atoms independently take isotopes as usual, then each
+group contributes a fixed number of atoms drawn uniformly without
+replacement to the fragment (the rest form the residual), and the exact
+conditional distribution of the fragment's shift is reported.
 """
 
 from __future__ import annotations
@@ -33,8 +38,8 @@ import itertools
 import re
 import sys
 from fractions import Fraction
-from math import gcd
-from typing import Dict, List, Optional, Tuple
+from math import comb, gcd
+from typing import Annotated, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -363,6 +368,35 @@ class DiscriminationPlanResponse(BaseModel):
     accuracy: str  # reduced fraction "n/d"
     # Candidate preferred when the ion lands in the windows; null on a tie.
     hit_choice: Optional[int]
+
+
+class FragmentSpectrumRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    atom_groups: List[AtomGroup] = Field(min_length=1, max_length=4)
+    # fragment_counts[g]: how many of group g's atoms join the fragment.
+    fragment_counts: List[Annotated[int, Field(strict=True, ge=0)]]
+    target_parent_shift_mda: int = Field(strict=True, ge=0, le=2000)
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "FragmentSpectrumRequest":
+        validate_atom_groups(self.atom_groups)
+        if len(self.fragment_counts) != len(self.atom_groups):
+            raise ValueError(
+                "fragment_counts must have exactly one entry per atom group"
+            )
+        for group, count in zip(self.atom_groups, self.fragment_counts):
+            if count > group.count:
+                raise ValueError("fragment_counts entries must be <= group count")
+        return self
+
+
+class FragmentSpectrumResponse(BaseModel):
+    reachable: bool
+    probability: str  # reduced fraction "n/d"
+    # Non-zero fragment-shift peaks conditioned on the observed parent
+    # shift, ascending by shift_mda; omitted when the parent peak is zero.
+    peaks: Optional[List[Peak]] = None
 
 
 def convolve(left: Distribution, right: Distribution) -> Distribution:
@@ -1033,7 +1067,139 @@ def candidate_posterior(
     return joints, candidate_marginals, offset_marginals
 
 
-app = FastAPI(title="Isotope Envelope API", version="1.6.0")
+# Integer state of one group after its atoms are assigned:
+# (parent_shift, fragment_shift, drawn_count) -> summed sequence weight.
+FragmentIntState = Dict[Tuple[int, int, int], int]
+
+# Integer state once the drawn-count layer is fixed:
+# (parent_shift, fragment_shift) -> weight.
+FragmentIntState2D = Dict[Tuple[int, int], int]
+
+
+def group_fragment_state(
+    group: AtomGroup, drawn: int, target: int
+) -> Tuple[FragmentIntState2D, int]:
+    """Scaled joint (parent shift, fragment shift) state for one group.
+
+    The LCM ``L_g`` of the abundance denominators is factored out: isotope j
+    carries the plain integer ``n_j * L_g / d_j``. The atoms are assigned in
+    input order; an isotope-j atom adds ``(shift_j, shift_j)`` when labelled
+    fragment (exactly ``drawn`` such labels in total) or ``(shift_j, 0)`` when
+    labelled residual. A fixed isotope assignment admits exactly
+    C(count, drawn) binary label sequences with that many fragment labels,
+    one per equiprobable subset. Partial parent shifts above ``target`` are
+    discarded (all shifts non-negative and the groups independent, so such
+    states can never contribute to the target parent peak).
+
+    Returns the state restricted to the layer with exactly ``drawn`` fragment
+    atoms and the denominator factor ``L_g**count``: each raw weight divided
+    by this factor equals C(count, drawn) times the joint probability of that
+    (parent shift, fragment shift), i.e. the selection probability contributes
+    no further factor (all C(count, drawn) subsets are equiprobable).
+    """
+    fractions = [iso.abundance_fraction for iso in group.isotopes]
+    scale = 1
+    for fraction in fractions:
+        scale = scale * fraction.denominator // gcd(scale, fraction.denominator)
+    numerators = [
+        fraction.numerator * (scale // fraction.denominator)
+        for fraction in fractions
+    ]
+    shifts = [iso.shift_mda for iso in group.isotopes]
+
+    state: FragmentIntState = {(0, 0, 0): 1}
+    for _ in range(group.count):
+        nxt: FragmentIntState = {}
+        for (parent, fragment, used), weight in state.items():
+            for shift, numerator in zip(shifts, numerators):
+                if numerator == 0:
+                    continue
+                next_parent = parent + shift
+                if next_parent > target:
+                    continue
+                # Label this atom residual.
+                key = (next_parent, fragment, used)
+                nxt[key] = nxt.get(key, 0) + weight * numerator
+                # Label this atom fragment.
+                if used < drawn:
+                    key = (next_parent, fragment + shift, used + 1)
+                    nxt[key] = nxt.get(key, 0) + weight * numerator
+        state = nxt
+
+    fixed: FragmentIntState2D = {
+        (parent, fragment): weight
+        for (parent, fragment, used), weight in state.items()
+        if used == drawn and weight != 0
+    }
+    return fixed, scale ** group.count
+
+
+def convolve_fragment_states(
+    left: FragmentIntState2D, right: FragmentIntState2D, target: int
+) -> FragmentIntState2D:
+    """Convolution of two groups' joint states, dropping parent shift > target."""
+    out: FragmentIntState2D = {}
+    for (parent_a, fragment_a), weight_a in left.items():
+        for (parent_b, fragment_b), weight_b in right.items():
+            parent = parent_a + parent_b
+            if parent > target:
+                continue
+            key = (parent, fragment_a + fragment_b)
+            out[key] = out.get(key, 0) + weight_a * weight_b
+    return out
+
+
+def fragment_spectrum(
+    groups: List[AtomGroup], fragment_counts: List[int], target: int
+) -> Tuple[Fraction, Distribution]:
+    """Parent-peak probability and the conditional fragment-shift distribution.
+
+    Every parent atom independently takes an isotope with its abundance; once
+    the isotope values are fixed, each group independently contributes exactly
+    ``fragment_counts[g]`` of its atoms to the fragment, chosen uniformly
+    without replacement among the ``C(count, fragment_counts)`` subsets, and
+    the remaining atoms form the residual. The fragment shift is the summed
+    isotope shift of the drawn atoms.
+
+    Each group's raw weights are scaled by its abundance-denominator LCM to
+    the ``count``-th power (see ``group_fragment_state``) and additionally sum
+    ``C(count, drawn)`` ordered label sequences per isotope assignment, so the
+    convolved raw weight of a (parent shift, fragment shift) cell equals
+    ``D * C * P(cell)`` with ``D`` the product of the per-group scale factors
+    and ``C`` the product of the per-group subset counts. The parent-peak
+    probability is therefore the target-row weight divided by ``D * C`` and
+    the conditional fragment probability at a shift is the cell weight divided
+    by the target-row weight (both common factors cancel). Returns the exact
+    parent probability and the full conditional distribution (zero entries
+    omitted); an unreachable parent gives probability 0 and an empty
+    distribution.
+    """
+    state: FragmentIntState2D = {(0, 0): 1}
+    denominator = 1
+    subset_count = 1
+    for group, drawn in zip(groups, fragment_counts):
+        group_state, factor = group_fragment_state(group, drawn, target)
+        denominator *= factor
+        subset_count *= comb(group.count, drawn)
+        state = convolve_fragment_states(state, group_state, target)
+
+    target_weight = sum(
+        weight for (parent, _fragment), weight in state.items() if parent == target
+    )
+    if target_weight == 0:
+        return Fraction(0), {}
+    parent_probability = Fraction(target_weight, denominator * subset_count)
+
+    conditional: Distribution = {}
+    for (parent, fragment), weight in state.items():
+        if parent == target and weight != 0:
+            conditional[fragment] = conditional.get(fragment, Fraction(0)) + Fraction(
+                weight, target_weight
+            )
+    return parent_probability, conditional
+
+
+app = FastAPI(title="Isotope Envelope API", version="1.7.0")
 
 
 @app.post("/v1/envelope", response_model=EnvelopeResponse)
@@ -1194,6 +1360,35 @@ def compute_discrimination_plan(
         hit_probabilities=[to_fraction_str(p0), to_fraction_str(p1)],
         accuracy=to_fraction_str(accuracy),
         hit_choice=hit_choice,
+    )
+
+
+@app.post(
+    "/v1/fragment-spectrum",
+    response_model=FragmentSpectrumResponse,
+    response_model_exclude_none=True,
+)
+def compute_fragment_spectrum(
+    request: FragmentSpectrumRequest,
+) -> FragmentSpectrumResponse:
+    probability, conditional = fragment_spectrum(
+        request.atom_groups,
+        request.fragment_counts,
+        request.target_parent_shift_mda,
+    )
+    if probability == 0:
+        return FragmentSpectrumResponse(
+            reachable=False, probability=to_fraction_str(Fraction(0))
+        )
+    peaks = [
+        to_peak(shift, prob)
+        for shift, prob in sorted(conditional.items())
+        if prob != 0
+    ]
+    return FragmentSpectrumResponse(
+        reachable=True,
+        probability=to_fraction_str(probability),
+        peaks=peaks,
     )
 
 

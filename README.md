@@ -6,9 +6,10 @@
 此外还提供：给定单个观测峰的**归因**接口（该峰的精确概率与条件期望原子数），针对
 观测峰概率区间求解多组分混合比例的接口，在固定采样预算下规划**采集窗口**的接口，
 有限离子采样下多个（可重叠）检测窗口同时达标的**联合检出概率**接口，在共同
-整数校准偏移下对 2～4 个互斥候选做精确贝叶斯**候选/偏移后验**推断的接口，以及在
-两个等先验候选之间规划**判别窗口**、精确最大化判别准确率的接口，
-同样全程精确有理数运算。
+整数校准偏移下对 2～4 个互斥候选做精确贝叶斯**候选/偏移后验**推断的接口，在
+两个等先验候选之间规划**判别窗口**、精确最大化判别准确率的接口，以及在给定母离子
+观测偏移下计算**碎片谱**（母离子原子独立取同位素后，各组再等概率无放回抽取指定个数
+原子形成碎片）的条件偏移分布的接口，同样全程精确有理数运算。
 
 ## 启动
 
@@ -636,6 +637,91 @@ curl -s -X POST http://localhost:8000/v1/discrimination-plan \
   }'
 ```
 
+### `POST /v1/fragment-spectrum`
+
+模拟母离子碎裂：母离子的每个原子仍按 `/v1/envelope` 的规则**独立**取同位素；
+在全部同位素取值**确定之后**，对每组原子再**等概率、无放回**地抽取
+`fragment_counts[g]` 个原子形成碎片，其余原子构成残余（不贡献碎片偏移）。
+即固定同位素取值后，第 `g` 组共有 `C(count, fragment_counts[g])` 个等可能的
+碎片原子子集，各组独立抽取；`fragment_counts[g]` 允许取 `0`（全不抽）或
+`count`（全抽）。给定母离子的**观测质量偏移** `target_parent_shift_mda`，
+汇总全部同位素取值路径与全部抽样路径，返回该母峰的精确概率，以及在**已观测到
+该母峰**的条件下，碎片总质量偏移的完整条件分布，全程 `Fraction` 运算。
+
+请求体：
+
+```json
+{
+  "atom_groups": [
+    {
+      "count": 3,
+      "isotopes": [
+        {"shift_mda": 0, "abundance": "1/2"},
+        {"shift_mda": 1, "abundance": "1/2"}
+      ]
+    }
+  ],
+  "fragment_counts": [1],
+  "target_parent_shift_mda": 1
+}
+```
+
+字段与约束（任一不满足即返回 **422**）：
+
+| 字段 | 约束 |
+| --- | --- |
+| `atom_groups` | 与 `/v1/envelope` 完全相同的校验（1～4 组、各组 `count` 总和 ≤ 80、最大可能总偏移 ≤ 2000 等） |
+| `fragment_counts` | 整数数组，**每组一项、顺序与组数一致**；每项满足 `0 ≤ fragment_counts[g] ≤ 对应组的 count` |
+| `target_parent_shift_mda` | 整数，0～2000 |
+
+响应（200）。母峰可达时：
+
+```json
+{
+  "reachable": true,
+  "probability": "3/8",
+  "peaks": [
+    {"shift_mda": 0, "probability": "2/3"},
+    {"shift_mda": 1, "probability": "1/3"}
+  ]
+}
+```
+
+母峰概率为零时（没有任何同位素取值路径能产生该偏移）：
+
+```json
+{"reachable": false, "probability": "0/1"}
+```
+
+- `probability`：母离子观测偏移的（无条件）峰概率，与 `/v1/envelope` 同偏移的
+  峰概率一致，已约分的 `"n/d"`；与 `fragment_counts` 无关。
+- `peaks`：条件于该母峰的**碎片偏移完整分布**，仅含非零项，按 `shift_mda`
+  升序；各项 `probability` 为已约分的 `"n/d"`，全部之和恰为 `1`。碎片偏移
+  恒不超过母离子偏移。仅在 `reachable=true` 时返回。
+- 母峰不可达时返回 `reachable=false`、`probability="0/1"`，不返回 `peaks`。
+
+上例中 3 个各以 1/2 概率偏移 1 的原子，母偏移为 1 的概率是 `C(3,1)/8 = 3/8`；
+条件下恰有一个重原子，碎片只抽 1 个原子，抽中它的概率为 1/3（碎片偏移 1）、
+抽不中为 2/3（碎片偏移 0）。`fragment_counts=[0]` 时碎片恒在偏移 0；
+`fragment_counts=[3]`（全抽）时碎片偏移恒等于母偏移。
+
+### 调用示例
+
+```bash
+curl -s -X POST http://localhost:8000/v1/fragment-spectrum \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "atom_groups": [
+      {"count": 3, "isotopes": [
+        {"shift_mda": 0, "abundance": "1/2"},
+        {"shift_mda": 1, "abundance": "1/2"}
+      ]}
+    ],
+    "fragment_counts": [1],
+    "target_parent_shift_mda": 1
+  }'
+```
+
 ### `GET /healthz`
 
 健康检查，返回 `{"status": "ok"}`。
@@ -701,6 +787,17 @@ DP 全程在整数上进行；最优窗口端点必落在**权重为正**的格�
 偏好；落窗概率、准确率与 `hit_choice` 由最终窗口直接在完整峰型上求和得到，
 各分数一次性约分输出。
 
+`/v1/fragment-spectrum` 同样把每组丰度分母的最小公倍数 `L_g` 作为公因数提出，
+逐原子在整数上做动态规划：状态为 `(母离子偏移, 碎片偏移, 已抽入碎片的原子数)`，
+每个原子按其同位素整数权重延伸两条分支——标记为**残余**只增加母偏移，标记为
+**碎片**同时增加母偏移与碎片偏移且计数加一；只保留"恰好抽出指定个数"的状态层，
+超过目标母偏移的部分状态直接舍弃（所有偏移非负、各组独立）。每个确定的同位素
+取值恰有 `C(count, k)` 个等可能的无放回子集，而有序的碎片/残余标记序列总数也是
+`C(count, k)`，故每个子集被等权计入一次，无需额外加权。各组状态做二维卷积合并后，
+母峰概率为目标母偏移行的权重除以 `Π L_g**count · Π C(count, k)`；条件碎片概率为
+格权重除以该行总权重（公共因子全部约去），天然归一，最终仅在构造 `Fraction` 时
+约分一次输出。目标母峰权重为零时返回 `reachable=false` 并省略 `peaks`。
+
 ## 测试
 
 ```bash
@@ -713,13 +810,14 @@ pytest
 穷举所有不相交窗口组合的暴力求解器的随机对拍、检出概率与枚举全部离子采样
 序列的暴力求解器的随机对拍、候选后验与枚举每个（候选, δ）下全部离子序列的
 贝叶斯暴力求解器的随机对拍、判别窗口规划与穷举所有不相交窗口组合并按
-（|p0−p1|、格数、窗口数、展平端点）决胜的暴力求解器的随机对拍，
+（|p0−p1|、格数、窗口数、展平端点）决胜的暴力求解器的随机对拍、碎片谱与
+枚举全部同位素取值路径及各组全部无放回子集抽取路径的暴力求解器的随机对拍，
 以及全部非法输入的 422 用例。
 
 ## 项目结构
 
 ```
-app/main.py          # FastAPI 应用：校验模型 + 精确卷积 + 精确有理数 LP + 带符号权重窗口 DP（采集/判别共用）+ 检出概率 DP + 候选/偏移后验
+app/main.py          # FastAPI 应用：校验模型 + 精确卷积 + 精确有理数 LP + 带符号窗口 DP（采集/判别共用）+ 检出概率 DP + 候选/偏移后验 + 碎片谱条件分布
 tests/test_envelope.py
 tests/test_peak_attribution.py
 tests/test_mixture_bounds.py
@@ -727,6 +825,7 @@ tests/test_acquisition_plan.py
 tests/test_detection_probability.py
 tests/test_candidate_posterior.py
 tests/test_discrimination_plan.py
+tests/test_fragment_spectrum.py
 requirements.txt     # 运行依赖
 requirements-dev.txt # 测试依赖
 Dockerfile

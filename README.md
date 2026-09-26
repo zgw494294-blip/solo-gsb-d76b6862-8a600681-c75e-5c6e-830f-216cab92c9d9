@@ -7,8 +7,9 @@
 观测峰概率区间求解多组分混合比例的接口，在固定采样预算下规划**采集窗口**的接口，
 有限离子采样下多个（可重叠）检测窗口同时达标的**联合检出概率**接口，在共同
 整数校准偏移下对 2～4 个互斥候选做精确贝叶斯**候选/偏移后验**推断的接口，以及在
-两个等先验候选之间规划**判别窗口**、精确最大化判别准确率的接口，
-同样全程精确有理数运算。
+两个等先验候选之间规划**判别窗口**、精确最大化判别准确率的接口，以及给定母离子
+观测偏移时、各组等概率无放回抽取原子形成碎片的**碎片谱**接口（母峰概率与碎片
+偏移的完整条件分布），同样全程精确有理数运算。
 
 ## 启动
 
@@ -636,6 +637,87 @@ curl -s -X POST http://localhost:8000/v1/discrimination-plan \
   }'
 ```
 
+### `POST /v1/fragment-spectrum`
+
+给定母离子观测偏移 `target_parent_shift_mda`：母离子的全部原子先**独立地取同位素**
+（与 `/v1/envelope` 相同）；取值确定后，每组从其 `count` 个原子中**等概率无放回**抽取
+`fragment_counts[g]` 个形成**碎片**，其余为**残余**（允许全不抽或全抽）。汇总全部同位素
+取值与抽样路径，返回母离子峰概率，以及在**已观测到该母偏移**的条件下碎片偏移（被抽中
+原子的偏移之和）的**完整条件分布**，全程精确有理数运算。
+
+请求体：
+
+```json
+{
+  "atom_groups": [
+    {
+      "count": 2,
+      "isotopes": [
+        {"shift_mda": 0, "abundance": "3/4"},
+        {"shift_mda": 1, "abundance": "1/4"}
+      ]
+    }
+  ],
+  "fragment_counts": [1],
+  "target_parent_shift_mda": 1
+}
+```
+
+字段与约束（任一不满足即返回 **422**）：
+
+| 字段 | 约束 |
+| --- | --- |
+| `atom_groups` | 与 `/v1/envelope` 完全相同的校验（1～4 组、各组 `count` 总和 ≤ 80、最大可能总偏移 ≤ 2000 等） |
+| `fragment_counts` | 整数数组，**长度必须等于组数**；第 `g` 项满足 `0 ≤ fragment_counts[g] ≤ 第 g 组 count` |
+| `target_parent_shift_mda` | 整数，0～2000 |
+
+响应（200）。目标母峰可达时：
+
+```json
+{
+  "reachable": true,
+  "probability": "3/8",
+  "peaks": [
+    {"shift_mda": 0, "probability": "1/2"},
+    {"shift_mda": 1, "probability": "1/2"}
+  ]
+}
+```
+
+目标母峰概率为零时（没有任何同位素取值路径能产生该母偏移）：
+
+```json
+{"reachable": false, "probability": "0/1"}
+```
+
+- `probability`：母离子在目标偏移处的（无条件）峰概率，已约分的 `"n/d"`；
+  与 `/v1/peak-attribution` 在同一偏移处的 `probability` 一致。
+- `peaks`：碎片偏移的**条件分布**（条件为母偏移等于目标值），全部非零峰按
+  `shift_mda` 升序，概率为已约分的 `"n/d"`，各峰概率之和恒为 `1/1`。
+  仅在 `reachable=true` 时返回；目标母峰不可达时省略该字段。
+- 碎片偏移总在 `0` 到目标母偏移之间；`fragment_counts` 全为 0 时碎片恒为
+  `[{"shift_mda": 0, "probability": "1/1"}]`，全取满时碎片恒等于母偏移。
+
+上例中母偏移 1 由"一轻一重"两条路径产生（概率 `3/8`）；在该条件下被抽中的那个
+原子等概率为轻或重，故碎片偏移 0 与 1 各为 `1/2`。
+
+### 调用示例
+
+```bash
+curl -s -X POST http://localhost:8000/v1/fragment-spectrum \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "atom_groups": [
+      {"count": 2, "isotopes": [
+        {"shift_mda": 0, "abundance": "3/4"},
+        {"shift_mda": 1, "abundance": "1/4"}
+      ]}
+    ],
+    "fragment_counts": [1],
+    "target_parent_shift_mda": 1
+  }'
+```
+
 ### `GET /healthz`
 
 健康检查，返回 `{"status": "ok"}`。
@@ -701,6 +783,18 @@ DP 全程在整数上进行；最优窗口端点必落在**权重为正**的格�
 偏好；落窗概率、准确率与 `hit_choice` 由最终窗口直接在完整峰型上求和得到，
 各分数一次性约分输出。
 
+`/v1/fragment-spectrum` 对每组 `g`：组成向量 `n`（各同位素的原子数，`|n| = count`）
+的概率为多项权重 `multinomial(count; n) · Π p_j^{n_j}`；在组成 `n` 下，等概率无放回
+抽取 `f_g` 个原子得到子组成 `m` 的条件概率为 `Π C(n_j, m_j) / C(count, f_g)`
+（Vandermonde 恒等式保证其对全部 `m` 求和为 1）。把每组丰度分母的最小公倍数
+`L_g` 与 `C(count, f_g)` 作为公因数提出后，每组的（母偏移, 碎片偏移）联合权重都是
+整数（`multinomial(count; n) · Π a_j^{n_j} · Π C(n_j, m_j)`，其中 `a_j` 为整数化丰度），
+通过（组成、子组成）双重递归枚举并按偏移对合并；各组的偏移对分布再跨组卷积，
+全程整数运算，超过目标母偏移的部分路径直接舍弃（所有偏移非负）。最终母峰概率为
+`分子 / Π L_g^{count} · C(count, f_g)`，碎片条件分布为各碎片偏移的
+`权重 / 母峰分子`（公因数约去），每个输出仅构造一次 `Fraction` 约分；
+零丰度同位素在枚举前剔除（含它的组成权重必为零）。
+
 ## 测试
 
 ```bash
@@ -713,13 +807,14 @@ pytest
 穷举所有不相交窗口组合的暴力求解器的随机对拍、检出概率与枚举全部离子采样
 序列的暴力求解器的随机对拍、候选后验与枚举每个（候选, δ）下全部离子序列的
 贝叶斯暴力求解器的随机对拍、判别窗口规划与穷举所有不相交窗口组合并按
-（|p0−p1|、格数、窗口数、展平端点）决胜的暴力求解器的随机对拍，
+（|p0−p1|、格数、窗口数、展平端点）决胜的暴力求解器的随机对拍、碎片谱与枚举
+全部（同位素取值 × 无放回子集）路径的暴力求解器的随机对拍，
 以及全部非法输入的 422 用例。
 
 ## 项目结构
 
 ```
-app/main.py          # FastAPI 应用：校验模型 + 精确卷积 + 精确有理数 LP + 带符号权重窗口 DP（采集/判别共用）+ 检出概率 DP + 候选/偏移后验
+app/main.py          # FastAPI 应用：校验模型 + 精确卷积 + 精确有理数 LP + 带符号权重窗口 DP（采集/判别共用）+ 检出概率 DP + 候选/偏移后验 + 碎片谱
 tests/test_envelope.py
 tests/test_peak_attribution.py
 tests/test_mixture_bounds.py
@@ -727,6 +822,7 @@ tests/test_acquisition_plan.py
 tests/test_detection_probability.py
 tests/test_candidate_posterior.py
 tests/test_discrimination_plan.py
+tests/test_fragment_spectrum.py
 requirements.txt     # 运行依赖
 requirements-dev.txt # 测试依赖
 Dockerfile

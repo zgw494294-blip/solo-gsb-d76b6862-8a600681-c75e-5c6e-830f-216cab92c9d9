@@ -24,7 +24,13 @@ windows that discriminate between two equal-prior candidates: at most K
 disjoint closed intervals within a bin budget, exactly maximizing the
 accuracy (1 + |p0 - p1|) / 2 of the rule "an ion inside the windows votes
 for the candidate with the higher hit probability, an ion outside votes
-for the other one", with fully specified exact tie-breaking.
+for the other one", with fully specified exact tie-breaking. An eighth
+endpoint conditions on an observed parent-ion shift: the parent atoms take
+isotopes independently, then each group draws a fixed number of its atoms
+uniformly without replacement to form a fragment (the rest are the
+residual); summed over all isotope assignments and draw paths, it returns
+the parent peak probability and the exact conditional distribution of the
+fragment shift, again exactly over Q.
 """
 
 from __future__ import annotations
@@ -33,11 +39,18 @@ import itertools
 import re
 import sys
 from fractions import Fraction
-from math import gcd
+from math import comb, gcd
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import FastAPI
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 # Detection probabilities are exact fractions whose reduced denominator can
 # reach (lcm of abundance denominators)**(total atoms * ions) — tens of
@@ -363,6 +376,38 @@ class DiscriminationPlanResponse(BaseModel):
     accuracy: str  # reduced fraction "n/d"
     # Candidate preferred when the ion lands in the windows; null on a tie.
     hit_choice: Optional[int]
+
+
+class FragmentSpectrumRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    atom_groups: List[AtomGroup] = Field(min_length=1, max_length=4)
+    # fragment_counts[g]: how many of group g's atoms form the fragment.
+    fragment_counts: List[StrictInt] = Field(min_length=1, max_length=4)
+    target_parent_shift_mda: int = Field(strict=True, ge=0, le=2000)
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "FragmentSpectrumRequest":
+        validate_atom_groups(self.atom_groups)
+        if len(self.fragment_counts) != len(self.atom_groups):
+            raise ValueError(
+                "fragment_counts must have exactly one entry per atom group"
+            )
+        for frag_count, group in zip(self.fragment_counts, self.atom_groups):
+            if not 0 <= frag_count <= group.count:
+                raise ValueError(
+                    "each fragment count must satisfy 0 <= fragment_count "
+                    "<= the corresponding group count"
+                )
+        return self
+
+
+class FragmentSpectrumResponse(BaseModel):
+    reachable: bool
+    probability: str  # reduced fraction "n/d"
+    # Conditional fragment-shift distribution given the parent shift: non-zero
+    # peaks ascending by shift. Only present when reachable.
+    peaks: Optional[List[Peak]] = None
 
 
 def convolve(left: Distribution, right: Distribution) -> Distribution:
@@ -1033,7 +1078,162 @@ def candidate_posterior(
     return joints, candidate_marginals, offset_marginals
 
 
-app = FastAPI(title="Isotope Envelope API", version="1.6.0")
+def group_fragment_pairs(
+    group: AtomGroup, frag_count: int, target: int
+) -> Tuple[Dict[Tuple[int, int], int], int]:
+    """Integer joint (parent, fragment) shift-pair weights of one group.
+
+    The group's ``count`` atoms take isotopes independently; then
+    ``frag_count`` of them are drawn uniformly without replacement to form
+    the fragment (the rest are the residual). Returns the joint distribution
+    over (parent shift, fragment shift) as plain integer weights together
+    with the common denominator ``L**count * C(count, frag_count)``, where
+    ``L`` is the LCM of the group's abundance denominators: each pair's exact
+    probability is ``weight / denominator``.
+
+    A composition n (atom counts per isotope) carries the integer weight
+    ``multinomial(count; n) * prod(scaled_abundance_j**n_j)`` and a fragment
+    draw realizing the sub-composition m carries ``prod C(n_j, m_j)``; both
+    are enumerated recursively (compositions, then sub-compositions) and
+    merged by shift pair. Compositions whose parent shift already exceeds
+    ``target`` are pruned (all shifts are non-negative), and zero-abundance
+    isotopes are dropped up front since every composition using them has
+    weight zero.
+    """
+    count = group.count
+    scale = 1
+    for iso in group.isotopes:
+        fraction = iso.abundance_fraction
+        scale = scale * fraction.denominator // gcd(scale, fraction.denominator)
+    shifts: List[int] = []
+    powers: List[List[int]] = []
+    for iso in group.isotopes:
+        fraction = iso.abundance_fraction
+        if fraction == 0:
+            continue
+        scaled = fraction.numerator * (scale // fraction.denominator)
+        shifts.append(iso.shift_mda)
+        powers.append([scaled**atoms for atoms in range(count + 1)])
+    kind = len(shifts)
+
+    pairs: Dict[Tuple[int, int], int] = {}
+    composition = [0] * kind
+    suffix = [0] * kind  # suffix[j]: sum of composition[j:], set per leaf
+
+    def walk_fragment(
+        j: int,
+        frag_left: int,
+        frag_shift: int,
+        choose: int,
+        parent_shift: int,
+        weight: int,
+    ) -> None:
+        if frag_left > suffix[j]:
+            return  # the remaining isotopes cannot supply enough atoms
+        if j == kind - 1:
+            choose *= comb(composition[j], frag_left)
+            frag_shift += frag_left * shifts[j]
+            key = (parent_shift, frag_shift)
+            pairs[key] = pairs.get(key, 0) + weight * choose
+            return
+        for take in range(min(frag_left, composition[j]) + 1):
+            walk_fragment(
+                j + 1,
+                frag_left - take,
+                frag_shift + take * shifts[j],
+                choose * comb(composition[j], take),
+                parent_shift,
+                weight,
+            )
+
+    def walk_isotopes(j: int, atoms_left: int, parent_shift: int, weight: int) -> None:
+        if j == kind - 1:
+            composition[j] = atoms_left
+            parent_shift += atoms_left * shifts[j]
+            if parent_shift > target:
+                return
+            total = 0
+            for t in range(kind - 1, -1, -1):
+                total += composition[t]
+                suffix[t] = total
+            walk_fragment(
+                0, frag_count, 0, 1, parent_shift, weight * powers[j][atoms_left]
+            )
+            return
+        for take in range(atoms_left + 1):
+            composition[j] = take
+            next_shift = parent_shift + take * shifts[j]
+            if next_shift > target:
+                break  # shifts are non-negative and `take` only grows
+            walk_isotopes(
+                j + 1,
+                atoms_left - take,
+                next_shift,
+                weight * comb(atoms_left, take) * powers[j][take],
+            )
+
+    walk_isotopes(0, count, 0, 1)
+    return pairs, scale**count * comb(count, frag_count)
+
+
+def fragment_spectrum(
+    groups: List[AtomGroup], frag_counts: List[int], target: int
+) -> Tuple[Fraction, Optional[Dict[int, Fraction]]]:
+    """Parent-peak probability and conditional fragment-shift law, over Q.
+
+    Every atom of every group first takes an isotope independently (the
+    parent ion); then, within each group, ``frag_counts[g]`` of the group's
+    atoms are drawn uniformly without replacement to form the fragment and
+    the rest are the residual. Conditioning on the parent's total shift
+    being ``target``, the fragment shift is the summed shift of the drawn
+    atoms. Returns the exact (unconditional) probability of the parent
+    shift ``target`` and, when that is non-zero, the exact conditional
+    distribution of the fragment shift as a shift -> probability mapping;
+    a zero-probability parent shift yields ``(0, None)``.
+
+    Each group's joint (parent shift, fragment shift) pair-distribution is
+    computed by ``group_fragment_pairs`` as plain integer weights with the
+    common denominator ``L_g**count * C(count, frag_count)`` held
+    symbolically; the pair-distributions are convolved across groups in
+    integer arithmetic, pruning every partial parent shift above ``target``
+    (all shifts are non-negative). Each output is reduced exactly once at
+    the end: the parent probability is ``numerator / denominator`` and the
+    conditional fragment probabilities are ``weight / parent_numerator``
+    (the factored denominators cancel).
+    """
+    state: Dict[Tuple[int, int], int] = {(0, 0): 1}
+    denominator = 1
+    for group, frag_count in zip(groups, frag_counts):
+        pairs, factor = group_fragment_pairs(group, frag_count, target)
+        denominator *= factor
+        merged: Dict[Tuple[int, int], int] = {}
+        for (parent_a, frag_a), weight_a in state.items():
+            for (parent_b, frag_b), weight_b in pairs.items():
+                parent = parent_a + parent_b
+                if parent > target:
+                    continue
+                key = (parent, frag_a + frag_b)
+                merged[key] = merged.get(key, 0) + weight_a * weight_b
+        state = merged
+
+    parent_numerator = 0
+    fragment_weights: Dict[int, int] = {}
+    for (parent, frag), weight in state.items():
+        if parent != target:
+            continue
+        parent_numerator += weight
+        fragment_weights[frag] = fragment_weights.get(frag, 0) + weight
+    if parent_numerator == 0:
+        return Fraction(0), None
+    probability = Fraction(parent_numerator, denominator)
+    peaks = {
+        frag: Fraction(weight, parent_numerator)
+        for frag, weight in fragment_weights.items()
+    }
+    return probability, peaks
+
+
+app = FastAPI(title="Isotope Envelope API", version="1.7.0")
 
 
 @app.post("/v1/envelope", response_model=EnvelopeResponse)
@@ -1194,6 +1394,30 @@ def compute_discrimination_plan(
         hit_probabilities=[to_fraction_str(p0), to_fraction_str(p1)],
         accuracy=to_fraction_str(accuracy),
         hit_choice=hit_choice,
+    )
+
+
+@app.post(
+    "/v1/fragment-spectrum",
+    response_model=FragmentSpectrumResponse,
+    response_model_exclude_none=True,
+)
+def compute_fragment_spectrum(
+    request: FragmentSpectrumRequest,
+) -> FragmentSpectrumResponse:
+    probability, peaks = fragment_spectrum(
+        request.atom_groups,
+        request.fragment_counts,
+        request.target_parent_shift_mda,
+    )
+    if probability == 0:
+        return FragmentSpectrumResponse(
+            reachable=False, probability=to_fraction_str(Fraction(0))
+        )
+    return FragmentSpectrumResponse(
+        reachable=True,
+        probability=to_fraction_str(probability),
+        peaks=[to_peak(shift, prob) for shift, prob in sorted(peaks.items())],
     )
 
 

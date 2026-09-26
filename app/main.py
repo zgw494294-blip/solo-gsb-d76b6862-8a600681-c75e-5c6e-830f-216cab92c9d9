@@ -1,0 +1,1202 @@
+"""Isotope peak-envelope calculation API.
+
+Computes the exact isotope fine-structure envelope for independent atom
+groups using rational (Fraction) arithmetic. No pruning is applied at any
+stage: every path is merged by mass shift and kept with its exact
+probability. A second endpoint solves for mixture weights of several
+components against observed peak-probability intervals, also exactly over Q.
+A third endpoint attributes a single observed peak: its exact probability
+and, conditioned on observing that shift, the expected atom count of every
+isotope in every group, again exactly over Q. A fourth endpoint plans
+acquisition windows for the full envelope: at most K disjoint closed
+intervals within a bin budget, maximizing exactly captured probability with
+fully specified exact tie-breaking. A fifth endpoint samples a finite number
+of ions independently from the full envelope and computes, exactly over Q,
+the joint probability that every (possibly overlapping) detection window
+collects at least its required number of hits, together with each window's
+marginal success probability. A sixth endpoint performs exact Bayesian
+candidate/offset inference: each of 2-4 mutually exclusive candidates
+carries its own envelope and an ``n/d`` prior, all ions share one
+uniform-prior integer calibration offset, and the exact multinomial
+likelihood of binned ion counts yields joint, per-candidate and per-offset
+posteriors, all reduced over Q. A seventh endpoint plans acquisition
+windows that discriminate between two equal-prior candidates: at most K
+disjoint closed intervals within a bin budget, exactly maximizing the
+accuracy (1 + |p0 - p1|) / 2 of the rule "an ion inside the windows votes
+for the candidate with the higher hit probability, an ion outside votes
+for the other one", with fully specified exact tie-breaking.
+"""
+
+from __future__ import annotations
+
+import itertools
+import re
+import sys
+from fractions import Fraction
+from math import gcd
+from typing import Dict, List, Optional, Tuple
+
+from fastapi import FastAPI
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+# Detection probabilities are exact fractions whose reduced denominator can
+# reach (lcm of abundance denominators)**(total atoms * ions) — tens of
+# thousands of digits — and must be printed in full, so lift Python's
+# default 4300-digit int<->str conversion cap well past that bound.
+sys.set_int_max_str_digits(1_000_000)
+
+ABUNDANCE_PATTERN = re.compile(r"^(\d{1,4})/(\d{1,4})$")
+MAX_DENOMINATOR = 1000
+
+# A probability distribution over total mass shift (mDa), exact rationals.
+Distribution = Dict[int, Fraction]
+
+
+def parse_abundance(value: str) -> Fraction:
+    """Parse an ``n/d`` abundance string into a Fraction.
+
+    Enforces 0 <= n <= d and 1 <= d <= 1000.
+    """
+    match = ABUNDANCE_PATTERN.match(value)
+    if match is None:
+        raise ValueError("abundance must be a string of the form 'n/d'")
+    numerator, denominator = int(match.group(1)), int(match.group(2))
+    if not 1 <= denominator <= MAX_DENOMINATOR:
+        raise ValueError("abundance denominator d must satisfy 1 <= d <= 1000")
+    if numerator > denominator:
+        raise ValueError("abundance must satisfy 0 <= n <= d")
+    return Fraction(numerator, denominator)
+
+
+class Isotope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    shift_mda: int = Field(strict=True, ge=0)
+    abundance: str
+
+    @field_validator("abundance")
+    @classmethod
+    def _validate_abundance(cls, value: str) -> str:
+        parse_abundance(value)
+        return value
+
+    @property
+    def abundance_fraction(self) -> Fraction:
+        return parse_abundance(self.abundance)
+
+
+class AtomGroup(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    count: int = Field(strict=True, ge=1, le=40)
+    isotopes: List[Isotope] = Field(min_length=2, max_length=3)
+
+    @model_validator(mode="after")
+    def _validate_group(self) -> "AtomGroup":
+        shifts = [iso.shift_mda for iso in self.isotopes]
+        if len(set(shifts)) != len(shifts):
+            raise ValueError("shift_mda values within one group must be distinct")
+        total = sum((iso.abundance_fraction for iso in self.isotopes), Fraction(0))
+        if total != 1:
+            raise ValueError("isotope abundances within one group must sum to exactly 1")
+        return self
+
+
+def validate_atom_groups(groups: List[AtomGroup]) -> None:
+    """Cross-group constraints shared by every atom_groups list."""
+    if sum(group.count for group in groups) > 80:
+        raise ValueError("total count across all groups must be <= 80")
+    max_total_shift = sum(
+        group.count * max(iso.shift_mda for iso in group.isotopes)
+        for group in groups
+    )
+    if max_total_shift > 2000:
+        raise ValueError("maximum possible total shift must be <= 2000 mDa")
+
+
+class EnvelopeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    atom_groups: List[AtomGroup] = Field(min_length=1, max_length=4)
+    k: int = Field(strict=True, ge=1, le=20)
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "EnvelopeRequest":
+        validate_atom_groups(self.atom_groups)
+        return self
+
+
+class Peak(BaseModel):
+    shift_mda: int
+    probability: str  # reduced fraction "n/d"
+
+
+class EnvelopeResponse(BaseModel):
+    peaks: List[Peak]
+    top_peaks: List[Peak]
+
+
+class PeakAttributionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    atom_groups: List[AtomGroup] = Field(min_length=1, max_length=4)
+    target_shift_mda: int = Field(strict=True, ge=0, le=2000)
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "PeakAttributionRequest":
+        validate_atom_groups(self.atom_groups)
+        return self
+
+
+class PeakAttributionResponse(BaseModel):
+    reachable: bool
+    probability: str  # reduced fraction "n/d"
+    # expected_counts[g][i]: expected atoms of isotope i in group g, in the
+    # input ordering, conditioned on the target shift; reduced "n/d".
+    expected_counts: Optional[List[List[str]]] = None
+
+
+class Observation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    shift_mda: int = Field(strict=True, ge=0, le=2000)
+    lower: str
+    upper: str
+
+    @field_validator("lower", "upper")
+    @classmethod
+    def _validate_bound(cls, value: str) -> str:
+        parse_abundance(value)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> "Observation":
+        if self.lower_fraction > self.upper_fraction:
+            raise ValueError("lower must be <= upper")
+        return self
+
+    @property
+    def lower_fraction(self) -> Fraction:
+        return parse_abundance(self.lower)
+
+    @property
+    def upper_fraction(self) -> Fraction:
+        return parse_abundance(self.upper)
+
+
+class Component(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    atom_groups: List[AtomGroup] = Field(min_length=1, max_length=4)
+
+    @model_validator(mode="after")
+    def _validate_component(self) -> "Component":
+        validate_atom_groups(self.atom_groups)
+        return self
+
+
+class MixtureBoundsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    components: List[Component] = Field(min_length=2, max_length=4)
+    observations: List[Observation] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "MixtureBoundsRequest":
+        shifts = [obs.shift_mda for obs in self.observations]
+        if len(set(shifts)) != len(shifts):
+            raise ValueError("observation shift_mda values must be distinct")
+        return self
+
+
+class WeightRange(BaseModel):
+    min: str  # reduced fraction "n/d"
+    max: str  # reduced fraction "n/d"
+
+
+class MixtureBoundsResponse(BaseModel):
+    feasible: bool
+    ranges: Optional[List[WeightRange]] = None
+    weights: Optional[List[str]] = None
+
+
+class AcquisitionPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    atom_groups: List[AtomGroup] = Field(min_length=1, max_length=4)
+    max_windows: int = Field(strict=True, ge=1, le=6)
+    budget: int = Field(strict=True, ge=1, le=200)
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "AcquisitionPlanRequest":
+        validate_atom_groups(self.atom_groups)
+        return self
+
+
+class AcquisitionPlanResponse(BaseModel):
+    windows: List[List[int]]  # [l, r] pairs, ascending by l
+    total_bins: int
+    captured_probability: str  # reduced fraction "n/d"
+
+
+class DetectionWindow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    l: int = Field(strict=True, ge=0, le=2000)
+    r: int = Field(strict=True, ge=0, le=2000)
+    min_hits: int = Field(strict=True, ge=1, le=4)
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> "DetectionWindow":
+        if self.l > self.r:
+            raise ValueError("l must be <= r")
+        return self
+
+
+class DetectionProbabilityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    atom_groups: List[AtomGroup] = Field(min_length=1, max_length=4)
+    ion_count: int = Field(strict=True, ge=1, le=80)
+    windows: List[DetectionWindow] = Field(min_length=1, max_length=4)
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "DetectionProbabilityRequest":
+        validate_atom_groups(self.atom_groups)
+        return self
+
+
+class DetectionProbabilityResponse(BaseModel):
+    joint_probability: str  # reduced fraction "n/d"
+    # marginal_probabilities[j]: P(window j reaches min_hits), input order.
+    marginal_probabilities: List[str]  # reduced "n/d"
+
+
+class PosteriorObservation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    shift_mda: int = Field(strict=True, ge=0, le=2000)
+    count: int = Field(strict=True, ge=0, le=80)
+
+
+class PosteriorCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    atom_groups: List[AtomGroup] = Field(min_length=1, max_length=4)
+    prior: str
+
+    @field_validator("prior")
+    @classmethod
+    def _validate_prior(cls, value: str) -> str:
+        parse_abundance(value)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_candidate(self) -> "PosteriorCandidate":
+        validate_atom_groups(self.atom_groups)
+        return self
+
+    @property
+    def prior_fraction(self) -> Fraction:
+        return parse_abundance(self.prior)
+
+
+class CandidatePosteriorRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: List[PosteriorCandidate] = Field(min_length=2, max_length=4)
+    ion_count: int = Field(strict=True, ge=1, le=80)
+    observations: List[PosteriorObservation] = Field(min_length=1, max_length=8)
+    calibration_radius: int = Field(strict=True, ge=0, le=3)
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "CandidatePosteriorRequest":
+        if sum(
+            (candidate.prior_fraction for candidate in self.candidates),
+            Fraction(0),
+        ) != 1:
+            raise ValueError("candidate priors must be non-negative and sum to 1")
+        shifts = [obs.shift_mda for obs in self.observations]
+        if len(set(shifts)) != len(shifts):
+            raise ValueError("observation shift_mda values must be distinct")
+        if sum(obs.count for obs in self.observations) > self.ion_count:
+            raise ValueError("observation counts must sum to <= ion_count")
+        return self
+
+
+class CandidatePosteriorResponse(BaseModel):
+    possible: bool
+    # joint_posteriors[i][j]: P(candidate i, offset delta_j | data), candidates
+    # in input order and offsets ascending within each candidate.
+    joint_posteriors: Optional[List[List[str]]] = None
+    # candidate_posteriors[i]: P(candidate i | data), input order.
+    candidate_posteriors: Optional[List[str]] = None
+    # offset_posteriors[j]: P(offset delta_j | data), offsets ascending.
+    offset_posteriors: Optional[List[str]] = None
+    offsets: Optional[List[int]] = None
+
+
+class DiscriminationCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    atom_groups: List[AtomGroup] = Field(min_length=1, max_length=4)
+
+    @model_validator(mode="after")
+    def _validate_candidate(self) -> "DiscriminationCandidate":
+        validate_atom_groups(self.atom_groups)
+        return self
+
+
+class DiscriminationPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: List[DiscriminationCandidate] = Field(min_length=2, max_length=2)
+    max_windows: int = Field(strict=True, ge=1, le=6)
+    budget: int = Field(strict=True, ge=1, le=200)
+
+
+class DiscriminationPlanResponse(BaseModel):
+    windows: List[List[int]]  # [l, r] pairs, ascending by l
+    total_bins: int
+    # hit_probabilities[i]: P(ion lands in the windows | candidate i), input order.
+    hit_probabilities: List[str]  # reduced "n/d"
+    accuracy: str  # reduced fraction "n/d"
+    # Candidate preferred when the ion lands in the windows; null on a tie.
+    hit_choice: Optional[int]
+
+
+def convolve(left: Distribution, right: Distribution) -> Distribution:
+    """Exact convolution of two shift distributions over Q; no pruning."""
+    out: Distribution = {}
+    for shift_a, prob_a in left.items():
+        if prob_a == 0:
+            continue
+        for shift_b, prob_b in right.items():
+            if prob_b == 0:
+                continue
+            shift = shift_a + shift_b
+            out[shift] = out.get(shift, Fraction(0)) + prob_a * prob_b
+    return out
+
+
+def group_distribution(group: AtomGroup) -> Distribution:
+    """Distribution of the summed shift of ``count`` independent atoms."""
+    single: Distribution = {
+        iso.shift_mda: iso.abundance_fraction
+        for iso in group.isotopes
+        if iso.abundance_fraction != 0
+    }
+    dist: Distribution = {0: Fraction(1)}
+    for _ in range(group.count):
+        dist = convolve(dist, single)
+    return dist
+
+
+def envelope_distribution(groups: List[AtomGroup]) -> Distribution:
+    """Full envelope: convolve every group's distribution, merging by shift."""
+    dist: Distribution = {0: Fraction(1)}
+    for group in groups:
+        dist = convolve(dist, group_distribution(group))
+    return dist
+
+
+# Attribution state for a fixed target shift, using a factored common
+# denominator: entry weights and first moments at partial shift s are the
+# numerators (plain integers) for the probability * denom and the
+# probability-weighted summed atom counts * denom, respectively. Each group
+# contributes the factor L_g**count where L_g is the LCM of its abundance
+# denominators, so the inner loop stays in Z and a single Fraction reduction
+# happens at the end.
+IntAttributionState = Dict[int, Tuple[int, List[int]]]
+
+
+def convolve_int_attribution(
+    left: IntAttributionState, right: IntAttributionState
+) -> IntAttributionState:
+    """Integer convolution: cross-multiply weights and first moments."""
+    out: IntAttributionState = {}
+    for shift_a, (weight_a, moments_a) in left.items():
+        for shift_b, (weight_b, moments_b) in right.items():
+            shift = shift_a + shift_b
+            entry = out.get(shift)
+            if entry is None:
+                out[shift] = (
+                    weight_a * weight_b,
+                    [
+                        moment_a * weight_b + moment_b * weight_a
+                        for moment_a, moment_b in zip(moments_a, moments_b)
+                    ],
+                )
+            else:
+                prev_weight, moments = entry
+                for k, (moment_a, moment_b) in enumerate(
+                    zip(moments_a, moments_b)
+                ):
+                    moments[k] += moment_a * weight_b + moment_b * weight_a
+                out[shift] = (prev_weight + weight_a * weight_b, moments)
+    return out
+
+
+def group_int_attribution(
+    group: AtomGroup, offset: int, width: int, target: int
+) -> Tuple[IntAttributionState, int]:
+    """Integer attribution state of one group's ``count`` atoms.
+
+    The LCM ``L_g`` of the abundance denominators is factored out: every path
+    weight carries ``L_g**count`` in the caller-held common denominator, so
+    this state uses plain numerators (isotope j is scaled to
+    ``n_j * L_g / d_j``). Moments are likewise probability-weighted counts
+    times ``L_g`` per atom. Shifts above ``target`` are discarded.
+    """
+    isotopes = group.isotopes
+    fractions = [iso.abundance_fraction for iso in isotopes]
+    scale = 1
+    for fraction in fractions:
+        scale = scale * fraction.denominator // gcd(scale, fraction.denominator)
+    numerators = [
+        fraction.numerator * (scale // fraction.denominator)
+        for fraction in fractions
+    ]
+    shifts = [iso.shift_mda for iso in isotopes]
+
+    state: IntAttributionState = {0: (1, [0] * width)}
+    for _ in range(group.count):
+        single: IntAttributionState = {}
+        for j, (shift, numerator) in enumerate(zip(shifts, numerators)):
+            if numerator == 0:
+                continue
+            moments = [0] * width
+            moments[offset + j] = numerator
+            single[shift] = (numerator, moments)
+        state = convolve_int_attribution(state, single)
+        state = {shift: entry for shift, entry in state.items() if shift <= target}
+    return state, scale ** group.count
+
+
+def peak_attribution(
+    groups: List[AtomGroup], target: int
+) -> Tuple[Fraction, List[List[Fraction]]]:
+    """Peak probability at ``target`` and per-isotope conditional expectations.
+
+    Returns the exact unconditional probability of the target shift together
+    with the expected atom count of each isotope (group-major, isotope input
+    order) conditioned on observing that shift. Zero-probability targets give
+    probability 0 and all-zero expectations (the caller omits them).
+    """
+    offsets: List[int] = []
+    total = 0
+    for group in groups:
+        offsets.append(total)
+        total += len(group.isotopes)
+
+    state: IntAttributionState = {0: (1, [0] * total)}
+    denominator = 1
+    for group, offset in zip(groups, offsets):
+        group_state, factor = group_int_attribution(
+            group, offset, total, target
+        )
+        denominator *= factor
+        state = convolve_int_attribution(state, group_state)
+        state = {shift: entry for shift, entry in state.items() if shift <= target}
+
+    if target not in state:
+        zero = Fraction(0)
+        return zero, [[zero] * len(group.isotopes) for group in groups]
+    weight, moments = state[target]
+    probability = Fraction(weight, denominator)
+    # E[count | target] = moment / weight; the factored denominator cancels.
+    expectations = [
+        [
+            Fraction(moment, weight)
+            for moment in moments[offset : offset + len(group.isotopes)]
+        ]
+        for group, offset in zip(groups, offsets)
+    ]
+    return probability, expectations
+
+
+def to_fraction_str(value: Fraction) -> str:
+    return f"{value.numerator}/{value.denominator}"
+
+
+def to_peak(shift: int, prob: Fraction) -> Peak:
+    return Peak(shift_mda=shift, probability=to_fraction_str(prob))
+
+
+# A linear constraint const + sum(coeffs[i] * x_i) >= 0 over Q.
+Constraint = Tuple[List[Fraction], Fraction]
+
+
+def solve_linear_system(
+    matrix: List[List[Fraction]], rhs: List[Fraction]
+) -> Optional[List[Fraction]]:
+    """Solve a square system over Q by Gauss-Jordan elimination.
+
+    Returns the unique solution, or None when the matrix is singular.
+    """
+    size = len(matrix)
+    aug = [list(row) + [value] for row, value in zip(matrix, rhs)]
+    for col in range(size):
+        pivot = next((r for r in range(col, size) if aug[r][col] != 0), None)
+        if pivot is None:
+            return None
+        aug[col], aug[pivot] = aug[pivot], aug[col]
+        for row in range(size):
+            if row != col and aug[row][col] != 0:
+                factor = aug[row][col] / aug[col][col]
+                for k in range(col, size + 1):
+                    aug[row][k] -= factor * aug[col][k]
+    return [aug[i][size] / aug[i][i] for i in range(size)]
+
+
+def enumerate_vertices(
+    constraints: List[Constraint], dim: int
+) -> List[List[Fraction]]:
+    """Vertices of {x : const + coeffs·x >= 0} via exact constraint intersections."""
+    vertices: List[List[Fraction]] = []
+    for active in itertools.combinations(constraints, dim):
+        point = solve_linear_system(
+            [list(coeffs) for coeffs, _ in active],
+            [-const for _, const in active],
+        )
+        if point is None:
+            continue
+        if all(
+            const + sum(c * x for c, x in zip(coeffs, point)) >= 0
+            for coeffs, const in constraints
+        ):
+            vertices.append(point)
+    return vertices
+
+
+def mixture_weight_bounds(
+    envelopes: List[Distribution], observations: List[Observation]
+) -> Optional[Tuple[List[Tuple[Fraction, Fraction]], List[Fraction]]]:
+    """Exact feasible set of mixture weights, or None when empty.
+
+    Weights are non-negative and sum to 1; each observation constrains the
+    mixture probability at its shift (missing peaks count as 0) to its
+    closed interval, while unobserved shifts impose nothing. Eliminating
+    w_m = 1 - w_1 - ... - w_{m-1} leaves a bounded polytope, so per-weight
+    extrema and the lexicographically smallest feasible vector are read off
+    its vertices. Returns per-component (min, max) ranges and that
+    lexicographically smallest weight vector, both in input order.
+    """
+    count = len(envelopes)
+    dim = count - 1
+
+    constraints: List[Constraint] = []
+    for i in range(dim):  # w_i >= 0
+        coeffs = [Fraction(0)] * dim
+        coeffs[i] = Fraction(1)
+        constraints.append((coeffs, Fraction(0)))
+    # w_m = 1 - (w_1 + ... + w_{m-1}) >= 0
+    constraints.append(([Fraction(-1)] * dim, Fraction(1)))
+
+    for obs in observations:
+        probs = [env.get(obs.shift_mda, Fraction(0)) for env in envelopes]
+        base = probs[-1]
+        coeffs = [probs[i] - base for i in range(dim)]
+        # lower <= base + coeffs·x <= upper
+        constraints.append((coeffs, base - obs.lower_fraction))
+        constraints.append(([-c for c in coeffs], obs.upper_fraction - base))
+
+    vertices = enumerate_vertices(constraints, dim)
+    if not vertices:
+        return None
+
+    weights = [point + [Fraction(1) - sum(point, Fraction(0))] for point in vertices]
+    ranges = [
+        (min(w[i] for w in weights), max(w[i] for w in weights))
+        for i in range(count)
+    ]
+    return ranges, min(weights)
+
+
+def optimal_weighted_windows(
+    weighted: List[Tuple[int, int]], max_windows: int, budget: int
+) -> Tuple[List[Tuple[int, int]], int, int]:
+    """Optimal disjoint windows over signed integer bin weights, exactly.
+
+    ``weighted`` holds (shift, weight) pairs ascending by shift; every
+    grid bin not listed has weight 0. Chooses at most ``max_windows``
+    pairwise disjoint closed integer intervals [l, r] whose total bin
+    count sum(r - l + 1) (every grid bin of a window is billed, weighted
+    or not) stays within ``budget``, maximizing the summed weight inside
+    their union; the empty plan is allowed. Ties break by fewer total
+    bins, then fewer windows, then the lexicographically smaller
+    flattened endpoint list [l1, r1, l2, r2, ...] with windows ordered
+    by start.
+
+    Window endpoints can be restricted to listed bins with positive
+    weight: sliding an endpoint past a bin of weight <= 0 never changes
+    the captured weight and strictly reduces the bin count, so the
+    tie-break optimum always has endpoints on positive weights. The DP
+    below therefore walks the listed bins left to right (negative
+    weights stay in the walk: one may sit inside a window spanning two
+    positive bins, but no optimal window starts or ends on one).
+
+    Per processed bin, ``h[k][b]`` holds the best (captured, endpoints)
+    using exactly k windows and exactly b billed bins over the bins seen
+    so far, and ``g[k][b]`` the same restricted to states whose last bin
+    is covered (open window ending there). Transitions at bin x:
+
+    - leave x uncovered: carry h forward unchanged;
+    - cover x by extending the open window from the previous bin
+      (billed gap extra bins, last endpoint moves to x);
+    - cover x by opening a new window [x, x] on top of any h state with
+      one fewer window and one fewer bin.
+
+    Within one (k, b) cell the better candidate is the higher captured
+    weight, ties broken by the lexicographically smaller endpoint tuple;
+    appending a shared suffix or replacing a shared last endpoint
+    preserves that order, so keeping only the best prefix per cell is
+    exact. Returns the windows (ascending by start), the exact total bin
+    count and the captured weight as a plain integer.
+    """
+    windows_cap, bins_cap = max_windows, budget
+    # Cells are (captured_weight, flattened_endpoint_tuple) or None.
+    h: List[List[Optional[Tuple[int, Tuple[int, ...]]]]] = [
+        [None] * (bins_cap + 1) for _ in range(windows_cap + 1)
+    ]
+    g: List[List[Optional[Tuple[int, Tuple[int, ...]]]]] = [
+        [None] * (bins_cap + 1) for _ in range(windows_cap + 1)
+    ]
+    h[0][0] = (0, ())
+
+    prev_x: Optional[int] = None
+    for x, weight in weighted:
+        gap = x - prev_x if prev_x is not None else 0
+        prev_x = x
+        g_next: List[List[Optional[Tuple[int, Tuple[int, ...]]]]] = [
+            [None] * (bins_cap + 1) for _ in range(windows_cap + 1)
+        ]
+        for k in range(1, windows_cap + 1):
+            g_open = g[k]
+            h_prev = h[k - 1]
+            g_row = g_next[k]
+            for b in range(k, bins_cap + 1):
+                best: Optional[Tuple[int, Tuple[int, ...]]] = None
+                if gap and b >= gap:
+                    cand = g_open[b - gap]
+                    if cand is not None:
+                        best = (cand[0] + weight, cand[1][:-1] + (x,))
+                cand = h_prev[b - 1]
+                if cand is not None:
+                    prob = cand[0] + weight
+                    seq = cand[1] + (x, x)
+                    if (
+                        best is None
+                        or prob > best[0]
+                        or (prob == best[0] and seq < best[1])
+                    ):
+                        best = (prob, seq)
+                g_row[b] = best
+        for k in range(1, windows_cap + 1):
+            h_row = h[k]
+            g_row = g_next[k]
+            for b in range(k, bins_cap + 1):
+                cand = g_row[b]
+                if cand is None:
+                    continue
+                cur = h_row[b]
+                if (
+                    cur is None
+                    or cand[0] > cur[0]
+                    or (cand[0] == cur[0] and cand[1] < cur[1])
+                ):
+                    h_row[b] = cand
+        g = g_next
+
+    best_key: Optional[Tuple[int, int, int, Tuple[int, ...]]] = None
+    best_seq: Tuple[int, ...] = ()
+    best_num = 0
+    best_bins = 0
+    for k in range(windows_cap + 1):
+        for b in range(bins_cap + 1):
+            state = h[k][b]
+            if state is None:
+                continue
+            key = (-state[0], b, k, state[1])
+            if best_key is None or key < best_key:
+                best_key = key
+                best_num, best_seq = state
+                best_bins = b
+
+    windows = [
+        (best_seq[i], best_seq[i + 1]) for i in range(0, len(best_seq), 2)
+    ]
+    return windows, best_bins, best_num
+
+
+def acquisition_plan(
+    dist: Distribution, max_windows: int, budget: int
+) -> Tuple[List[Tuple[int, int]], int, Fraction]:
+    """Optimal acquisition windows over the full envelope, exactly.
+
+    Every non-zero peak contributes its probability as the bin weight;
+    all weights are scaled by the lcm of the peak denominators so the DP
+    runs on plain integers and stays exact, then delegated to
+    ``optimal_weighted_windows`` (see its docstring for the window
+    semantics, the DP and the tie-break chain). Returns the windows
+    (ascending by start), the exact total bin count and the captured
+    probability as a reduced Fraction.
+    """
+    peaks = sorted(
+        (shift, prob) for shift, prob in dist.items() if prob != 0
+    )
+    scale = 1
+    for _, prob in peaks:
+        scale = scale * prob.denominator // gcd(scale, prob.denominator)
+    weighted = [
+        (shift, prob.numerator * (scale // prob.denominator))
+        for shift, prob in peaks
+    ]
+    windows, total_bins, captured_num = optimal_weighted_windows(
+        weighted, max_windows, budget
+    )
+    return windows, total_bins, Fraction(captured_num, scale)
+
+
+def discrimination_plan(
+    dist0: Distribution,
+    dist1: Distribution,
+    max_windows: int,
+    budget: int,
+) -> Tuple[List[Tuple[int, int]], int, Fraction, Fraction, Fraction, Optional[int]]:
+    """Optimal windows discriminating two equal-prior candidates, over Q.
+
+    The two candidates carry the full envelope distributions ``dist0``
+    and ``dist1`` (no pruning) and share the prior 1/2. A plan is at
+    most ``max_windows`` pairwise disjoint closed integer intervals
+    [l, r] within the 0..2000 shift axis whose total bin count
+    sum(r - l + 1) (every grid bin billed, peaks or not) stays within
+    ``budget``; the empty plan is allowed. An ion landing inside the
+    union votes for the candidate with the higher hit probability and an
+    ion outside votes for the other one, so with
+    p_i = P(hit | candidate i) the exact accuracy is
+    (1 + |p0 - p1|) / 2 and the plan maximizes |p0 - p1|. Ties break by
+    fewer total bins, then fewer windows, then the lexicographically
+    smaller flattened endpoint list with windows ordered by start.
+
+    Maximizing |p0 - p1| splits into two orientations: maximize
+    p0 - p1 (per-bin weight w0 - w1) or p1 - p0 (weight w1 - w0). Each
+    orientation is exactly the signed-weight window DP of
+    ``optimal_weighted_windows`` over the union of both envelopes' peak
+    positions (bins outside the union carry weight 0 in both envelopes),
+    with all masses scaled by one common denominator lcm so the two
+    orientations compare exactly. The orientation with the higher value
+    wins; equal values fall back to the shared tie-break chain (bins,
+    windows, flattened endpoints) with no preference between
+    orientations. The hit probabilities, the accuracy and the preferred
+    candidate are then read off the chosen windows directly from the
+    full envelopes.
+
+    Returns the windows (ascending by start), the exact total bin count,
+    the per-candidate hit probabilities (candidate input order), the
+    accuracy and the hit-preferred candidate index (0 or 1; None when
+    the hit probabilities tie), every probability a reduced Fraction.
+    """
+    scale = 1
+    for dist in (dist0, dist1):
+        for prob in dist.values():
+            if prob != 0:
+                scale = scale * prob.denominator // gcd(scale, prob.denominator)
+    masses = [
+        {
+            shift: prob.numerator * (scale // prob.denominator)
+            for shift, prob in dist.items()
+            if prob != 0
+        }
+        for dist in (dist0, dist1)
+    ]
+    positions = sorted(set(masses[0]) | set(masses[1]))
+    forward = [
+        (x, masses[0].get(x, 0) - masses[1].get(x, 0)) for x in positions
+    ]
+    backward = [(x, -weight) for x, weight in forward]
+
+    best_key: Optional[Tuple[int, int, int, Tuple[int, ...]]] = None
+    best_windows: List[Tuple[int, int]] = []
+    best_bins = 0
+    for weighted in (forward, backward):
+        windows, bins, value = optimal_weighted_windows(
+            weighted, max_windows, budget
+        )
+        flat = tuple(endpoint for window in windows for endpoint in window)
+        key = (-value, bins, len(windows), flat)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_windows, best_bins = windows, bins
+
+    p0 = sum(
+        (
+            dist0.get(x, Fraction(0))
+            for left, right in best_windows
+            for x in range(left, right + 1)
+        ),
+        Fraction(0),
+    )
+    p1 = sum(
+        (
+            dist1.get(x, Fraction(0))
+            for left, right in best_windows
+            for x in range(left, right + 1)
+        ),
+        Fraction(0),
+    )
+    accuracy = (1 + abs(p0 - p1)) / 2
+    hit_choice = None if p0 == p1 else (0 if p0 > p1 else 1)
+    return best_windows, best_bins, p0, p1, accuracy, hit_choice
+
+
+def detection_probability(
+    dist: Distribution, windows: List[Tuple[int, int, int]], ion_count: int
+) -> Tuple[Fraction, List[Fraction]]:
+    """Joint and marginal window-detection probabilities, exactly over Q.
+
+    Each of ``ion_count`` ions is drawn independently from the full envelope
+    ``dist``; an ion landing at shift s scores one hit in every window
+    ``(l, r, min_hits)`` with ``l <= s <= r`` (windows may overlap or
+    coincide, and probability mass outside all windows is kept as a
+    hit-nothing outcome). A window succeeds when its hit count reaches
+    ``min_hits``. Returns the probability that every window succeeds
+    together with each window's own success probability, in input order.
+
+    A single ion realizes one of at most 2m+1 hit masks (sweeping the shift
+    axis, the mask of covered windows changes only at window endpoints), so
+    the ions follow a multinomial over those masks. The count vector is
+    tracked capped at each ``min_hits`` — at most 5**4 = 625 states — and
+    advanced ion by ion, never enumerating sampling sequences. All mask
+    probabilities are scaled by the lcm of their denominators, so the DP
+    runs on plain integers with denominator ``scale**ion_count`` carried
+    symbolically; each output is reduced exactly once at the end. A window
+    that can never succeed (e.g. ``min_hits > ion_count``) simply gets
+    numerator 0, yielding the exact "0/1" for itself and the joint event.
+    """
+    # Probability of each hit mask: bit j set iff the shift lies in window j.
+    mask_probs: Dict[int, Fraction] = {}
+    for shift, prob in dist.items():
+        if prob == 0:
+            continue
+        mask = 0
+        for j, (left, right, _) in enumerate(windows):
+            if left <= shift <= right:
+                mask |= 1 << j
+        mask_probs[mask] = mask_probs.get(mask, Fraction(0)) + prob
+
+    scale = 1
+    for prob in mask_probs.values():
+        scale = scale * prob.denominator // gcd(scale, prob.denominator)
+    scaled = [
+        (mask, prob.numerator * (scale // prob.denominator))
+        for mask, prob in mask_probs.items()
+        if prob != 0
+    ]
+
+    caps = [min_hits for _, _, min_hits in windows]
+    # Capped count vector encoded in mixed radix: idx = sum(counts[j]*mult[j]).
+    radices = [cap + 1 for cap in caps]
+    multipliers = [1]
+    for radix in radices[:-1]:
+        multipliers.append(multipliers[-1] * radix)
+    state_count = multipliers[-1] * radices[-1]
+
+    # transitions[idx][k]: state after one more ion drawing mask scaled[k][0].
+    transitions: List[List[int]] = []
+    for idx in range(state_count):
+        counts = [
+            (idx // mult) % radix for mult, radix in zip(multipliers, radices)
+        ]
+        row = []
+        for mask, _weight in scaled:
+            target = 0
+            for j, (mult, cap) in enumerate(zip(multipliers, caps)):
+                count = counts[j] + ((mask >> j) & 1)
+                if count > cap:
+                    count = cap
+                target += count * mult
+            row.append(target)
+        transitions.append(row)
+
+    weights = [weight for _, weight in scaled]
+    dp = [0] * state_count
+    dp[0] = 1
+    for _ in range(ion_count):
+        nxt = [0] * state_count
+        for idx, value in enumerate(dp):
+            if value == 0:
+                continue
+            row = transitions[idx]
+            for k, weight in enumerate(weights):
+                nxt[row[k]] += value * weight
+        dp = nxt
+
+    denominator = scale ** ion_count
+    full_idx = sum(
+        cap * mult for cap, mult in zip(caps, multipliers)
+    )
+    joint = Fraction(dp[full_idx], denominator)
+    marginals = [
+        Fraction(
+            sum(
+                value
+                for idx, value in enumerate(dp)
+                if value and (idx // mult) % radix == cap
+            ),
+            denominator,
+        )
+        for mult, radix, cap in zip(multipliers, radices, caps)
+    ]
+    return joint, marginals
+
+
+def multinomial_binned_likelihood(
+    dist: Distribution,
+    observations: List[Tuple[int, int]],
+    ion_count: int,
+) -> Fraction:
+    """Exact multinomial probability of binned ion counts, over Q.
+
+    Each ion is drawn independently from ``dist``; ``observations`` lists
+    ``(measured shift, count)`` bins and every unlisted shift collapses into
+    a single "other" bin holding the remaining ions. Returns the multinomial
+    probability of exactly that count vector. Following the standard
+    combinatorial convention ``0**0 = 1``, a zero-probability bin with a
+    zero count contributes nothing; the likelihood is zero exactly when a
+    positive-count bin (including "other") has zero probability.
+    """
+    remaining = ion_count
+    likelihood = Fraction(1)
+    covered = Fraction(0)
+    for shift, count in observations:
+        probability = dist.get(shift, Fraction(0))
+        likelihood *= probability**count
+        covered += probability
+        remaining -= count
+    other_probability = Fraction(1) - covered
+    likelihood *= other_probability**remaining
+    return likelihood
+
+
+def candidate_posterior(
+    envelopes: List[Distribution],
+    priors: List[Fraction],
+    observations: List[Tuple[int, int]],
+    ion_count: int,
+    radius: int,
+) -> Optional[Tuple[List[List[Fraction]], List[Fraction], List[Fraction]]]:
+    """Exact joint/candidate/offset posteriors, or None when data impossible.
+
+    Candidate ``i`` is drawn once with prior ``priors[i]``; conditioned on it,
+    all ions share one calibration offset delta drawn uniformly from
+    ``[-radius, radius]``, and each ion's measured shift is its independently
+    sampled envelope shift plus delta. The likelihood of the observed
+    count vector is the exact multinomial probability under
+    ``multinomial_binned_likelihood`` against the shifted envelope. Joint
+    unnormalized weights are
+
+        prior_i * (1/(2r+1)) * multinomial(counts | candidate i, delta)
+
+    (the multinomial coefficient is common to every weight and omitted).
+    Every weight is reduced exactly once; when the total evidence is zero the
+    observation has probability zero under every hypothesis and the caller
+    reports ``possible=false`` with no posteriors. Returns the joint table
+    (candidate input order, offsets ascending within each candidate), the
+    per-candidate marginals and the per-offset marginals, all normalized.
+    """
+    offsets = list(range(-radius, radius + 1))
+    weights: List[List[Fraction]] = []
+    for dist, prior in zip(envelopes, priors):
+        row: List[Fraction] = []
+        for delta in offsets:
+            shifted = {shift + delta: prob for shift, prob in dist.items()}
+            likelihood = multinomial_binned_likelihood(
+                shifted, observations, ion_count
+            )
+            # The uniform 1/(2r+1) offset prior is common to every cell and
+            # cancels in normalization, but keep it explicit for exactness.
+            row.append(prior * likelihood / len(offsets))
+        weights.append(row)
+
+    total = sum((sum(row, Fraction(0)) for row in weights), Fraction(0))
+    if total == 0:
+        return None
+    joints = [[weight / total for weight in row] for row in weights]
+    candidate_marginals = [
+        sum(row, Fraction(0)) / total for row in weights
+    ]
+    offset_marginals = [
+        sum(weights[i][j] for i in range(len(weights))) / total
+        for j in range(len(offsets))
+    ]
+    return joints, candidate_marginals, offset_marginals
+
+
+app = FastAPI(title="Isotope Envelope API", version="1.6.0")
+
+
+@app.post("/v1/envelope", response_model=EnvelopeResponse)
+def compute_envelope(request: EnvelopeRequest) -> EnvelopeResponse:
+    dist = envelope_distribution(request.atom_groups)
+
+    # All non-zero peaks, ascending by shift.
+    peaks = [to_peak(shift, prob) for shift, prob in sorted(dist.items()) if prob != 0]
+
+    # Top-k: probability descending, ties broken by shift ascending.
+    ranked = sorted(dist.items(), key=lambda item: (-item[1], item[0]))
+    top_peaks = [to_peak(shift, prob) for shift, prob in ranked[: request.k]]
+
+    return EnvelopeResponse(peaks=peaks, top_peaks=top_peaks)
+
+
+@app.post(
+    "/v1/peak-attribution",
+    response_model=PeakAttributionResponse,
+    response_model_exclude_none=True,
+)
+def compute_peak_attribution(
+    request: PeakAttributionRequest,
+) -> PeakAttributionResponse:
+    probability, expectations = peak_attribution(
+        request.atom_groups, request.target_shift_mda
+    )
+    if probability == 0:
+        return PeakAttributionResponse(
+            reachable=False, probability=to_fraction_str(Fraction(0))
+        )
+    return PeakAttributionResponse(
+        reachable=True,
+        probability=to_fraction_str(probability),
+        expected_counts=[
+            [to_fraction_str(value) for value in row] for row in expectations
+        ],
+    )
+
+
+@app.post(
+    "/v1/mixture-bounds",
+    response_model=MixtureBoundsResponse,
+    response_model_exclude_none=True,
+)
+def compute_mixture_bounds(request: MixtureBoundsRequest) -> MixtureBoundsResponse:
+    envelopes = [
+        envelope_distribution(component.atom_groups)
+        for component in request.components
+    ]
+    result = mixture_weight_bounds(envelopes, request.observations)
+    if result is None:
+        return MixtureBoundsResponse(feasible=False)
+    ranges, weights = result
+    return MixtureBoundsResponse(
+        feasible=True,
+        ranges=[
+            WeightRange(min=to_fraction_str(lo), max=to_fraction_str(hi))
+            for lo, hi in ranges
+        ],
+        weights=[to_fraction_str(w) for w in weights],
+    )
+
+
+@app.post(
+    "/v1/acquisition-plan",
+    response_model=AcquisitionPlanResponse,
+)
+def compute_acquisition_plan(
+    request: AcquisitionPlanRequest,
+) -> AcquisitionPlanResponse:
+    dist = envelope_distribution(request.atom_groups)
+    windows, total_bins, captured = acquisition_plan(
+        dist, request.max_windows, request.budget
+    )
+    return AcquisitionPlanResponse(
+        windows=[[left, right] for left, right in windows],
+        total_bins=total_bins,
+        captured_probability=to_fraction_str(captured),
+    )
+
+
+@app.post(
+    "/v1/detection-probability",
+    response_model=DetectionProbabilityResponse,
+)
+def compute_detection_probability(
+    request: DetectionProbabilityRequest,
+) -> DetectionProbabilityResponse:
+    dist = envelope_distribution(request.atom_groups)
+    windows = [(window.l, window.r, window.min_hits) for window in request.windows]
+    joint, marginals = detection_probability(dist, windows, request.ion_count)
+    return DetectionProbabilityResponse(
+        joint_probability=to_fraction_str(joint),
+        marginal_probabilities=[to_fraction_str(value) for value in marginals],
+    )
+
+
+@app.post(
+    "/v1/candidate-posterior",
+    response_model=CandidatePosteriorResponse,
+    response_model_exclude_none=True,
+)
+def compute_candidate_posterior(
+    request: CandidatePosteriorRequest,
+) -> CandidatePosteriorResponse:
+    envelopes = [
+        envelope_distribution(candidate.atom_groups)
+        for candidate in request.candidates
+    ]
+    priors = [candidate.prior_fraction for candidate in request.candidates]
+    observations = [(obs.shift_mda, obs.count) for obs in request.observations]
+    result = candidate_posterior(
+        envelopes,
+        priors,
+        observations,
+        request.ion_count,
+        request.calibration_radius,
+    )
+    if result is None:
+        return CandidatePosteriorResponse(possible=False)
+    joints, candidate_marginals, offset_marginals = result
+    offsets = list(
+        range(-request.calibration_radius, request.calibration_radius + 1)
+    )
+    return CandidatePosteriorResponse(
+        possible=True,
+        joint_posteriors=[
+            [to_fraction_str(value) for value in row] for row in joints
+        ],
+        candidate_posteriors=[
+            to_fraction_str(value) for value in candidate_marginals
+        ],
+        offset_posteriors=[
+            to_fraction_str(value) for value in offset_marginals
+        ],
+        offsets=offsets,
+    )
+
+
+@app.post(
+    "/v1/discrimination-plan",
+    response_model=DiscriminationPlanResponse,
+)
+def compute_discrimination_plan(
+    request: DiscriminationPlanRequest,
+) -> DiscriminationPlanResponse:
+    envelopes = [
+        envelope_distribution(candidate.atom_groups)
+        for candidate in request.candidates
+    ]
+    windows, total_bins, p0, p1, accuracy, hit_choice = discrimination_plan(
+        envelopes[0], envelopes[1], request.max_windows, request.budget
+    )
+    return DiscriminationPlanResponse(
+        windows=[[left, right] for left, right in windows],
+        total_bins=total_bins,
+        hit_probabilities=[to_fraction_str(p0), to_fraction_str(p1)],
+        accuracy=to_fraction_str(accuracy),
+        hit_choice=hit_choice,
+    )
+
+
+@app.get("/healthz")
+def healthz() -> dict:
+    return {"status": "ok"}
